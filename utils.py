@@ -5,6 +5,7 @@ import pandas as pd
 import itertools
 from collections import Counter
 import codecs
+import tqdm
 
 
 def zipf(word,wordcounts,d1=None,d2=None):
@@ -86,24 +87,24 @@ def vocabulary_dataframe(corpora, verbose=False, filter_common = True, min_count
         with codecs.open(f, encoding=encoding) as fin:
             wc = Counter(fin.read().split())
         if verbose: print("count",name)
-        
+
         # filter on min_count frequency
         if min_count:
             wc = {x : wc[x] for x in wc if wc[x] >= min_count}
             if verbose: print("min_count",name)
 
-        
+
         d1 = sum(wc.values())/1000000
         d2 = len(wc.keys())/1000000
         wordzipfers[name] = { word:zipf(word,wc,d1,d2) for word in wc.keys()}
         if verbose: print("zipf",name)
         del wc
-        
+
     # build dataframe of zipfs
     df = pd.DataFrame({"zipf %s" % (k) :v for k,v in wordzipfers.items()})
 
-    if verbose: print("dataframe done")    
-    
+    if verbose: print("dataframe done")
+
     # filter on shared vocab
     if filter_common:
         shared = None
@@ -114,7 +115,7 @@ def vocabulary_dataframe(corpora, verbose=False, filter_common = True, min_count
                 shared = shared.intersection(set(wordzipfers[k].keys()))
         df = df.filter(shared,axis=0)
         if verbose: print("common filter done")
-    
+
     return df
 
 
@@ -137,102 +138,134 @@ def comparative_dataframe(models, corpora, min_count = 5, filter_common = True, 
 def lexicon_refinement(lex, models, corpora, score_center = 0, zipf_cutoff=5, verbose=False, comp_df=None):
     ''' Create stable lexicon dataframe from lexicon dictionary, aligned models and corpora
     '''
+    # param:: lex: a dictionary with words and labels (as 1 and -1)
+    # param:: models: a list of embeddings
+    # param:: corpora: a list of .txt files
+    # param:: score_center: value to which rescale the labels
+    # param:: zipf_cutoff: minimum amount of zipf score for a word to be considered
+    # param:: verbose: print some output
+    # param:: comp_df: give a pre-compiled comparative dataframe. If not given, will be calculated
+
+    # Check if were given the same number of embeddings and corpora
     if len(models) != len(corpora): raise RuntimeError("%s != %s: models and corpora must be same length" % (len(models),len(corpora)) )
-    
+
+    # If not given, evaluate the comparative dataframe
     if comp_df is not None:
         df = comp_df
     else:
         df = comparative_dataframe(models, corpora)
-    
+
+    # Rescale the labels (valence score) to the center
     df['Valence'] = pd.Series(lex) - score_center
+    # Filter the comparative dataframe to the words in the lexicon
     df_val = df.filter(lex.keys(),axis=0)
-    
-    filter_zipf = np.logical_and( df_val.iloc[:,0] > zipf_cutoff, df_val.iloc[:,1] > zipf_cutoff)
-    filter_corr = np.logical_and( 
-                    df_val.iloc[:,2] == df_val.iloc[:,3],
-                    df_val.index == df_val.iloc[:,2])
-    return df_val[filter_zipf & filter_corr].Valence
+
+    # Create two filters.
+    # 1. Filter for the zipf_cutoff value, for all models (which are given as the first n columns)
+    df_val["Filter_zipf"] = [
+                            np.array([
+                                    row[n] > zipf_cutoff for n in range(len(models))
+                                    ]).all()
+                            for index, row in df_val.iterrows()
+                            ]
+    # 2. Filter for the correspondances: it must be that each word is the same for all
+    #    models given the correspondance, and the same to the starting one.
+    df_val["Filter_corr"] = np.logical_and(
+                                            np.array([
+                                                    np.array([
+                                                            row[len(models)] == row[len(models)+n]
+                                                            for n in range(len(models))
+                                                    ]).all()
+                                                    for index, row in df_val.iterrows()
+                                                    ]),
+                                            df_val.index == df_val.iloc[:,len(models)])
+    """
+    PROPOSAL: Maybe we could be a little less restrictive in the last condition,
+              in order to have more words in the final lexicon with all values.
+    """
+    # Return a series, where the index is the word and the key is the Valence (label)
+    return df_val[df_val["Filter_zipf"] & df_val["Filter_corr"]].Valence
 
 
 def enrich(lex, models, n_target=None, verbose=True, return_words=False, msteps=200):
     ''' Balance lexicon through data augmentation
     '''
     if not len(set( [m.wv.vector_size for m in models] )) == 1: raise RuntimeError("Models MUST have same vector_size")
-    
+
     dims = models[0].wv.vector_size
-    
+
     # how many IN TOTAL @ end
     if n_target is None:
         n_target = int((2*dims)*1.2)
-    
+
     word_pos = [k for k in lex.keys() if lex[k] > 0 ]
     word_neg = [k for k in lex.keys() if lex[k] < 0 ]
     word_full = word_pos + word_neg
-    
+
     vect_original = [np.mean( [models[0].wv[w], models[1].wv[w] ] , axis=0 ) for w in word_full ]
     vect_pos = vect_original[:len(word_pos)]
     vect_neg = vect_original[len(word_pos):]
-    
+
     labs = [lex[w] for w in word_full]
     labs_pos = labs[:len(word_pos)]
     labs_neg = labs[len(word_pos):]
-    
+
     word_new = []
     vect_new = []
     labs_new = []
-    
+
     i = 0
-    
+
     # balancing
     if len(word_pos) != len(word_neg):
-        
+
         word_minor = word_pos if len(word_pos)< len(word_neg) else word_neg
         vect_minor = vect_pos if len(word_pos)< len(word_neg) else vect_neg
         #l_minor = +1 if len(word_pos)< len(word_neg) else -1
         l_minor = labs_pos if len(word_pos)< len(word_neg) else labs_neg
-        
+
         delta = max(len(word_pos), len(word_neg)) - len(word_minor)
-        
+
         if verbose: print("Balancing: ", delta)
-        
+
         for _ in tqdm.tqdm(range( delta )):
 
             idx = np.random.choice(range(len(word_minor)))
-            
+
             w = word_minor[idx]
             v = augment_multi(w,models,m=msteps)[0]
             l = l_minor[idx]
-            
+
             word_new.append(w+"_%s" % i)
             vect_new.append(v)
             labs_new.append(l)
-            
+
             i+=1
-    
+
     word_balanced = word_full + word_new
     labs_balanced = np.append(labs, labs_new)
-    
+
     assert sum([x > 0 for x in labs_balanced ] ) == sum([x < 0 for x in labs_balanced ] )
-    
+
     # growth
     if len( word_balanced ) < n_target:
         delta = n_target - len( word_balanced )
-        
+
         if verbose: print("Growing: ", delta)
-        
+
         for _ in tqdm.tqdm(range(delta)):
             idx = np.random.choice(range(len(word_balanced)))
-            
+
             w = word_balanced[idx].split("_")[0]
             v = augment_multi(w,models,m=msteps)[0]
             l = labs_balanced[idx]
 
-            
+
             word_new.append(w+"_%s" % i)
             vect_new.append(v)
             labs_new.append(l)
             i+=1
-    
+
     if return_words:
         return np.append(vect_original,vect_new,axis=0), np.append(labs, labs_new), word_pos + word_neg + word_new
     else:
