@@ -190,6 +190,7 @@ def lexicon_refinement(lex, models, corpora, score_center = 0, zipf_cutoff=5, ve
 def enrich(lex, models, n_target=None, verbose=True, return_words=False, msteps=200):
     ''' Balance lexicon through data augmentation
     '''
+    '''work for multiple-models embeddings'''
     if not len(set( [m.wv.vector_size for m in models] )) == 1: raise RuntimeError("Models MUST have same vector_size")
 
     dims = models[0].wv.vector_size
